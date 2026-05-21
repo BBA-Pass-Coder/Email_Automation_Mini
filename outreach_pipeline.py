@@ -66,15 +66,24 @@ HAIR_KEYWORDS = [
 ]
 
 # =========================
-# Step 1: Fetch videos via Apify
+# Step 1: Fetch videos via Apify (direct REST API)
 # =========================
 
 def fetch_videos_for_handles(handles: list[str]) -> dict[str, list[dict]]:
     """
-    Calls clockworks/tiktok-scraper with a batch of profiles.
+    Calls clockworks/tiktok-scraper through Apify's REST API directly,
+    instead of going through the apify-client library's .call() method.
+
+    Why: the library tries to validate the actor's pricing metadata with
+    pydantic, and Apify's new tiered pricing format does not match the
+    library's schema, which crashes the run before any scraping happens.
+    Hitting the REST endpoints with plain HTTP avoids that validation
+    entirely. Behaviour and return shape are identical to before.
+
     Returns {handle: [video_dict, ...]} for handles that returned data.
     """
-    client = ApifyClient(APIFY_TOKEN)
+    import urllib.request
+    import urllib.error
 
     # Strip @ from handles, scraper expects bare usernames
     clean_handles = [h.lstrip("@").strip() for h in handles]
@@ -87,10 +96,66 @@ def fetch_videos_for_handles(handles: list[str]) -> dict[str, list[dict]]:
         "shouldDownloadSubtitles": False,
     }
 
-    print(f"[Apify] Scraping {len(clean_handles)} profiles...")
-    run = client.actor(APIFY_ACTOR).call(run_input=run_input)
+    # actor id in the REST API uses ~ instead of /
+    actor_id = APIFY_ACTOR.replace("/", "~")
 
-    items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+    def _api(url, data=None, method="GET"):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode() if data is not None else None,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode())
+
+    print(f"[Apify] Scraping {len(clean_handles)} profiles...")
+
+    # 1. Start the run
+    start_url = f"https://api.apify.com/v2/acts/{actor_id}/runs?token={APIFY_TOKEN}"
+    try:
+        run = _api(start_url, data=run_input, method="POST")["data"]
+    except urllib.error.HTTPError as e:
+        print(f"[Apify] Failed to start run: {e.code} {e.read().decode()[:300]}")
+        return {}
+    except Exception as e:
+        print(f"[Apify] Failed to start run: {e}")
+        return {}
+
+    run_id = run["id"]
+    dataset_id = run["defaultDatasetId"]
+
+    # 2. Poll until the run finishes
+    status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
+    waited = 0
+    MAX_WAIT = 1800  # 30 minutes safety cap
+    status = "READY"
+    while True:
+        time.sleep(5)
+        waited += 5
+        try:
+            status = _api(status_url)["data"]["status"]
+        except Exception as e:
+            print(f"[Apify] Status check failed: {e}")
+            return {}
+        if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+            print(f"[Apify] Run finished: {status}")
+            break
+        if waited >= MAX_WAIT:
+            print(f"[Apify] Stopped waiting after {MAX_WAIT}s (last status={status})")
+            break
+
+    if status != "SUCCEEDED":
+        print(f"[Apify] Warning: run status is {status}, reading whatever was collected")
+
+    # 3. Fetch dataset items
+    items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&format=json"
+    try:
+        items = _api(items_url)
+    except Exception as e:
+        print(f"[Apify] Failed to fetch dataset: {e}")
+        return {}
+
     print(f"[Apify] Got {len(items)} videos total")
 
     by_handle = {}
